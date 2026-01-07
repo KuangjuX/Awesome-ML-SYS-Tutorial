@@ -184,3 +184,41 @@ Scheduler 在主循环中拿到 `GenerationBatchResult` 后，会根据它携带
 - 同步令牌 (`copy_done`): 它携带了一个 CUDA Event。Scheduler 在真正需要访问 CPU 侧的 token ID 时（比如要把 token 发给用户），会调用 `result.copy_done.synchronize()`。这确保了 CPU 不会读到还没传输完成的脏数据。
 - 占位符管理 (`future_indices`): 在重叠模式中，当前的输出是下一个 batch 的输入。`GenerationBatchResult` 记录了这些 token 在 GPU `FutureMap` 中的位置索引，让下一个 batch 的计算能直接从 GPU 显存中读取结果，而不需要经过 CPU 再传递一遍。
 
+### KV Cache Management
+
+Scheduling 本身涉及到 KV Cache 管理的部分不多，所以能够单独拎出来分析分析。非常有意思的是，在 SGLang 刚出的时候，由于 RadixCache 和 PagedAttention 的结合，SGLang 比起只用 PagedAttention 的 vLLM 而言，在 throughput 上有非常夸张的优势。彼时大概是 2024 年 8 月左右，也是我刚刚开始加入 SGLang 社区的时候。不过，那时候我心里有个固执的想法，我总是拿着 RadixCache 和 PagedAttention 做对标，认为这是同一个生态位的两种技术。甚至我当时还问过颖老板（Ying Sheng），结果她一直给我说这两个东西不矛盾。非常惭愧，从那之后，我也没有理解到二者的关系。虽然不理解也不妨碍我做 RL sys，到底还是心头一直好奇。这几天重新开始梳理 Scheduler，才想明白为什么 RadixCache 和 PagedAttention 是不矛盾的。到了 25 年初，RadixCache 和 PageAttention 这两项技术在 SGLang 和 vLLM 都是默认开启的，实现了类似操作系统中的“二级索引”。
+
+实际上，Paged Attention 类似操作系统中的页表，解决了“逻辑缓存地址到物理存储地址”的映射问题；让逻辑上连续的 KV Cache 可以分布到物理上散乱的实际 VRAM 里，减少显存碎片；而 Radix Cache 则负责的是“缓存复用”的问题，前缀相同的 requests 能够复用一致的逻辑缓存地址，避免重复计算。
+
+| 维度 | Paged Attention (寻址层) | Radix Cache (策略层) |
+| :--- | :--- | :--- |
+| 解决的问题 | 显存碎片。解决逻辑连续但物理离散的问题。 | 重复计算。解决多个请求之间 KV 数据的共享。 |
+| OS 类比 | 页表 (Page Table)：将虚拟地址映射到物理页。 | 共享库/文件缓存：多个进程共用同一物理内存块。 |
+| 关注点 | 关注“怎么存”：如何利用不连续的显存块。 | 关注“存什么”：哪些前缀是一样的，可以复用。 |
+| 关系 | 没有分页，共享会因内存碎片而难以实施。 | 利用分页提供的灵活性，实现极致的复用。 |
+
+有了这些认知，我们通过三个 requests 的例子，来具体看看关键的数据结构 `req_to_token_pool` 和 `token_to_kv_pool`。
+
+假设系统正在处理以下三个共享部分前缀的请求：
+
+```python
+Request 1: ["A", "B", "C", "D"]
+Request 2: ["A", "B", "C", "F"]
+Request 3: ["A", "B", "G", "H"]
+```
+
+首先，我们来看一级逻辑索引池 `req_to_token_pool`。它是一个二维矩阵，行索引是请求 ID，列索引是 token 的位置，存储的是每个 token 的 KV Cache 的实际物理地址（location）。
+
+| 请求标识 (`req_pool_idx`) | Pos 0 | Pos 1 | Pos 2 | Pos 3 | 说明 (Radix Cache 决策结果) |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Request 1 (R1)** | **10** | **11** | **12** | **20** | 共享 ABC，私有 D |
+| **Request 2 (R2)** | **10** | **11** | **12** | **25** | 共享 ABC，私有 F |
+| **Request 3 (R3)** | **10** | **11** | **40** | **41** | 共享 AB，私有 GH |
+
+接着，我们来看二级物理索引 `token_to_kv_pool`，这是 GPU 显存中真正存放 KV Tensor 的地方。由于 Paged Attention 的存在，物理槽位完全不需要连续。
+
+| 物理槽位 (Slot Index) | ... | **10** | **11** | **12** | ... | **20** | ... | **25** | ... | **40** | **41** | ... |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **KV 数据内容** | 其他 token | **[A]** | **[B]** | **[C]** | 其他 token | **[D]** | 其他 token | **[F]** | 其他 token | **[G]** | **[H]** | 其他 token |
+| **共享状态 (策略层)** | 未知 | R1 R2 R3 共享 | R1 R2 R3 共享 | R1 R2 共享 | 未知 | R1 私有 | 未知 | R2 私有 | 未知 | R3 私有 | R3 私有 | 未知 |
+
