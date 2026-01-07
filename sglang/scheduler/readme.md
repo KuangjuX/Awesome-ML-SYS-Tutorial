@@ -293,58 +293,51 @@ class ReqToTokenPool:
 
 ```mermaid
 graph TD
-    %% 阶段 A：R1 的开荒过程
-    subgraph Phase_A [阶段 A：Request 1 首次进入 - A,B 共享, C,D 私有]
+    %% 定义物理池作为基座
+    subgraph L3 [L3: TokenToKVPool 物理显存层]
+        direction LR
+        S10[Slot 10: A] --- S11[Slot 11: B] --- S12[Slot 12: C] --- S20[Slot 20: D] --- S25[Slot 25: F]
+    end
+
+    %% 阶段一：R1 开荒
+    subgraph Step1 [阶段 1: Request 1 运行中]
         direction TB
-        R1_Input[Request 1: A-B-C-D]
+        R1_Logic["<b>Request 1: A-B-C-D</b>"]
         
-        subgraph L1_A [L1: Radix Cache]
-            Node_AB["Node: [A, B]<br/>(Existing)"]
+        subgraph R1_Mapping [L1 & L2 映射关系]
+            M1["[10, 11] <br/>命中 RadixTree"] 
+            M2["[12, 20] <br/>新分配 (私有)"]
         end
-
-        subgraph L2_A [L2: ReqToTokenPool]
-            R1_Row["R1 Row: [ 10 | 11 | 12 | 20 ]"]
-            R1_Row -- "10, 11 来自共享" --> Node_AB
-            R1_Row -- "12, 20 来自新分配" --> Free_Pool[Free Slots Pool]
-        end
+        
+        R1_Logic --> M1
+        R1_Logic --> M2
     end
 
-    %% 异步插入动作
-    R1_Row -.->|Prefill 完成后异步 Insert| Node_C
+    %% 核心转换动作
+    Step1 == "Prefill结束: 异步 Insert C 到 RadixTree" ==> Step2
 
-    %% 阶段 B：R2 的复用过程
-    subgraph Phase_B [阶段 B：Request 2 随后进入 - A,B,C 均变为共享]
+    %% 阶段二：R2 复用
+    subgraph Step2 [阶段 2: Request 2 随后进入]
         direction TB
-        R2_Input[Request 2: A-B-C-F]
-
-        subgraph L1_B [L1: Radix Cache]
-            Node_AB_New["Node: [A, B]"]
-            Node_C["Node: [C]<br/>Slot: 12<br/>(New Node!)"]
-            Node_AB_New --> Node_C
+        R2_Logic["<b>Request 2: A-B-C-F</b>"]
+        
+        subgraph R2_Mapping [L1 & L2 映射关系]
+            M3["[10, 11, 12] <br/>全部命中 RadixTree"]
+            M4["[25] <br/>新分配 (私有)"]
         end
-
-        subgraph L2_B [L2: ReqToTokenPool]
-            R2_Row["R2 Row: [ 10 | 11 | 12 | 25 ]"]
-            R2_Row -- "10, 11, 12 全部命中" --> Node_C
-            R2_Row -- "25 为新分配" --> Free_Pool_B[Free Slots Pool]
-        end
+        
+        R2_Logic --> M3
+        R2_Logic --> M4
     end
 
-    %% 物理层
-    subgraph L3 [L3: TokenToKVPool - 物理显存]
-        S10[Slot 10: A]
-        S11[Slot 11: B]
-        S12[Slot 12: C]
-        S20[Slot 20: D]
-        S25[Slot 25: F]
-    end
+    %% 映射到物理层
+    M1 -.-> S10 & S11
+    M2 -.-> S12 & S20
+    M3 -.-> S10 & S11 & S12
+    M4 -.-> S25
 
-    %% 物理映射关系
-    R1_Row ==> S10 & S11 & S12 & S20
-    R2_Row ==> S10 & S11 & S12 & S25
-
-    %% 样式
-    style Node_C fill:#c8e6c9,stroke:#2e7d32,stroke-width:2px
-    style Phase_A fill:#f5f5f5,stroke:#9e9e9e
-    style Phase_B fill:#fff3e0,stroke:#ef6c00
+    %% 样式美化
+    style S12 fill:#f96,stroke:#333,stroke-width:2px
+    style Step1 fill:#f5f5f5,stroke:#999
+    style Step2 fill:#e1f5fe,stroke:#01579b
 ```
