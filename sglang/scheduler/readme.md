@@ -293,60 +293,58 @@ class ReqToTokenPool:
 
 ```mermaid
 graph TD
-    %% 定义请求输入
-    subgraph Input [Request Input]
-        R1[Request 1: A-B-C-D]
-    end
-
-    %% L1 层：Radix Cache
-    subgraph L1 [L1: Radix Cache - 策略层/逻辑复用]
+    %% 阶段 A：R1 的开荒过程
+    subgraph Phase_A [阶段 A：Request 1 首次进入 - A,B 共享, C,D 私有]
         direction TB
-        Node1["Node: [A, B]<br/>Slots: [10, 11]<br/>lock_ref: 3"]
-        Node2["Node: [C]<br/>Slots: [12]<br/>lock_ref: 2"]
-        Node1 --> Node2
+        R1_Input[Request 1: A-B-C-D]
         
-        R1 -- "1. 匹配前缀" --> Node1
-        R1 -- "2. 匹配部分" --> Node2
-        R1 -- "3. 申请私有槽位" --> Private[Token: D]
+        subgraph L1_A [L1: Radix Cache]
+            Node_AB["Node: [A, B]<br/>(Existing)"]
+        end
+
+        subgraph L2_A [L2: ReqToTokenPool]
+            R1_Row["R1 Row: [ 10 | 11 | 12 | 20 ]"]
+            R1_Row -- "10, 11 来自共享" --> Node_AB
+            R1_Row -- "12, 20 来自新分配" --> Free_Pool[Free Slots Pool]
+        end
     end
 
-    %% L2 层：ReqToTokenPool
-    subgraph L2 [L2: ReqToTokenPool - 寻址层/页表映射]
+    %% 异步插入动作
+    R1_Row -.->|Prefill 完成后异步 Insert| Node_C
+
+    %% 阶段 B：R2 的复用过程
+    subgraph Phase_B [阶段 B：Request 2 随后进入 - A,B,C 均变为共享]
         direction TB
-        TableVal["[ 10 | 11 | 12 | 20 ]<br/>(映射向量)"]
-        
-        Node1 -- "填充 [10, 11]" --> TableVal
-        Node2 -- "填充 [12]" --> TableVal
-        Private -- "分配 [20]" --> TableVal
+        R2_Input[Request 2: A-B-C-F]
+
+        subgraph L1_B [L1: Radix Cache]
+            Node_AB_New["Node: [A, B]"]
+            Node_C["Node: [C]<br/>Slot: 12<br/>(New Node!)"]
+            Node_AB_New --> Node_C
+        end
+
+        subgraph L2_B [L2: ReqToTokenPool]
+            R2_Row["R2 Row: [ 10 | 11 | 12 | 25 ]"]
+            R2_Row -- "10, 11, 12 全部命中" --> Node_C
+            R2_Row -- "25 为新分配" --> Free_Pool_B[Free Slots Pool]
+        end
     end
 
-    %% L3 层：TokenToKVPool
-    subgraph L3 [L3: TokenToKVPool - 物理层/显存存储]
-        direction LR
-        S10["Slot 10: [A]"]
-        S11["Slot 11: [B]"]
-        S12["Slot 12: [C]"]
-        S20["Slot 20: [D]"]
+    %% 物理层
+    subgraph L3 [L3: TokenToKVPool - 物理显存]
+        S10[Slot 10: A]
+        S11[Slot 11: B]
+        S12[Slot 12: C]
+        S20[Slot 20: D]
+        S25[Slot 25: F]
     end
 
-    %% 模型前向映射
-    subgraph Forward [GPU Forward Stage]
-        Kernel[Paged Attention Kernel]
-    end
+    %% 物理映射关系
+    R1_Row ==> S10 & S11 & S12 & S20
+    R2_Row ==> S10 & S11 & S12 & S25
 
-    %% 连线关系 (修正后的语法)
-    TableVal -->|4. 读取物理索引| Kernel
-    Kernel ==> S10
-    Kernel ==> S11
-    Kernel ==> S12
-    Kernel ==> S20
-
-    %% 反馈循环
-    S20 -.->|5. 插入新节点| Node2
-    
     %% 样式
-    style L1 fill:#e1f5fe,stroke:#01579b
-    style L2 fill:#fff3e0,stroke:#ef6c00
-    style L3 fill:#e8f5e9,stroke:#2e7d32
-    style Forward fill:#f3e5f5,stroke:#7b1fa2
+    style Node_C fill:#c8e6c9,stroke:#2e7d32,stroke-width:2px
+    style Phase_A fill:#f5f5f5,stroke:#9e9e9e
+    style Phase_B fill:#fff3e0,stroke:#ef6c00
 ```
